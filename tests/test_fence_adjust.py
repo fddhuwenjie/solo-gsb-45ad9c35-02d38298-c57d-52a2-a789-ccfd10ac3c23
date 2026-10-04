@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 BASE = datetime(2026, 10, 6, 12, 0, 0, tzinfo=timezone.utc)
 
 
@@ -51,6 +53,22 @@ def event_keys(client, **params):
     r = client.get("/events", params=params)
     assert r.status_code == 200, r.text
     return [(e["device_id"], e["type"], e["ts"]) for e in r.json()]
+
+
+def event_rows(client, **params):
+    """返回事件的完整公开标识（含自增 id），用于检查其他围栏 id 是否变动。"""
+    r = client.get("/events", params=params)
+    assert r.status_code == 200, r.text
+    return [(e["id"], e["device_id"], e["fence_id"], e["type"], e["ts"]) for e in r.json()]
+
+
+def crossing_rows(client, **params):
+    r = client.get("/crossings", params=params)
+    assert r.status_code == 200, r.text
+    return [
+        (c["id"], c["device_id"], c["fence_id"], c["gate_id"], c["direction"], c["ts"])
+        for c in r.json()
+    ]
 
 
 def test_adjust_boundary_reapplies_to_existing_track(client):
@@ -246,6 +264,107 @@ def test_adjust_one_fence_leaves_other_fence_results_unchanged(client):
                config={"enter_dwell_s": 5})
     assert r.status_code == 200, r.text
     assert event_keys(client, fence_id=f2) == before_b
+
+
+def test_adjust_one_fence_keeps_other_fence_event_and_crossing_ids(client):
+    # 两个围栏各带门线；同一台设备先后进入 A、B 并分别穿越门线
+    fa = create_fence(client, square(0, 0, 0.02, 0.02), name="A")
+    fb = create_fence(client, square(0.04, 0.04, 0.06, 0.06), name="B")
+    # A 的门线偏在西侧，设备从 A 斜向跳到 B 的长线段不会再次扫到它
+    ga = client.post(f"/fences/{fa}/gates", json={
+        "geometry": {"type": "LineString",
+                     "coordinates": [[0.002, 0.015], [0.008, 0.015]]},
+        "forward_name": "A正向",
+        "reverse_name": "A反向",
+    }).json()["id"]
+    gb = client.post(f"/fences/{fb}/gates", json={
+        "geometry": {"type": "LineString",
+                     "coordinates": [[0.045, 0.05], [0.055, 0.05]]},
+        "forward_name": "B正向",
+        "reverse_name": "B反向",
+    }).json()["id"]
+    submit(client, [
+        pt("dev1", 0, 0.014, 0.005),
+        pt("dev1", 10, 0.016, 0.005),      # 穿 A 门线 forward
+        pt("dev1", 30, 0.049, 0.05),       # 斜向跳到 B 南门（不再扫过 A 门线）
+        pt("dev1", 40, 0.051, 0.05),       # 穿 B 门线 forward
+        pt("dev1", 50, 0.05, 0.05),
+    ])
+
+    events_b_before = event_rows(client, fence_id=fb)
+    crossings_b_before = crossing_rows(client, fence_id=fb)
+    assert [e[3] for e in events_b_before] == ["enter"]
+    assert [(c[3], c[4]) for c in crossings_b_before] == [(gb, "forward")]
+
+    # 调整 A：扩大边界（A 门线仍在新范围内）
+    r = adjust(client, fa, geometry=square(0, 0, 0.03, 0.03))
+    assert r.status_code == 200, r.text
+
+    # B 的事件与穿越：内容不变，且公开 id（含自增主键）逐行保持原样
+    assert event_rows(client, fence_id=fb) == events_b_before
+    assert crossing_rows(client, fence_id=fb) == crossings_b_before
+
+    # 再调整一次 A（缩小），B 的行与 id 依然不变；另一台只进过 B 的设备同样不动
+    submit(client, [pt("dev2", 60, 0.05, 0.05)])
+    events_b_before2 = event_rows(client, fence_id=fb)
+    crossings_b_before2 = crossing_rows(client, fence_id=fb)
+    events_dev2_before = event_rows(client, device_id="dev2")
+    r = adjust(client, fa, geometry=square(0, 0, 0.025, 0.025))
+    assert r.status_code == 200, r.text
+    assert event_rows(client, fence_id=fb) == events_b_before2
+    assert crossing_rows(client, fence_id=fb) == crossings_b_before2
+    assert event_rows(client, device_id="dev2") == events_dev2_before
+
+    # A 自身的事件/穿越按新定义重算：dev1 t30 后已在界外 -> enter/leave，
+    # 门线仍只穿越一次（A 的行使用新 id，不影响 B 的 id）
+    events_a = event_rows(client, fence_id=fa, device_id="dev1")
+    assert [e[3] for e in events_a] == ["enter", "leave"]
+    crossings_a = crossing_rows(client, fence_id=fa, device_id="dev1")
+    assert [(c[3], c[4]) for c in crossings_a] == [(ga, "forward")]
+
+    # 设备状态中两个围栏各占一行，均为最新结果
+    st = {s["fence_id"]: s["state"]
+          for s in client.get("/devices/dev1/status").json()["fences"]}
+    assert st == {fa: "outside", fb: "inside"}
+
+
+def test_adjust_rolls_back_definition_and_other_fence_rows_on_recompute_failure(
+    client, monkeypatch
+):
+    import app.main as main_module
+    from fastapi.testclient import TestClient
+
+    fa = create_fence(client, square(0, 0, 0.02, 0.02), name="A")
+    fb = create_fence(client, square(0.04, 0.04, 0.06, 0.06), name="B")
+    submit(client, [
+        pt("dev1", 0, 0.005, 0.005),
+        pt("dev2", 0, 0.05, 0.05),
+    ])
+
+    definition_before = client.get(f"/fences/{fa}").json()
+    events_all_before = event_rows(client)
+    crossings_all_before = crossing_rows(client)
+
+    # 模拟重算阶段失败：定义更新与衍生记录须整体回滚（服务端 500）
+    def boom(*args, **kwargs):
+        raise RuntimeError("recompute boom")
+
+    monkeypatch.setattr(main_module, "compute_events", boom)
+    quiet = TestClient(main_module.app, raise_server_exceptions=False)
+    r = adjust(quiet, fa, geometry=square(0, 0, 0.03, 0.03))
+    assert r.status_code == 500, r.text
+    monkeypatch.undo()
+
+    # 围栏定义恢复为调整前
+    assert client.get(f"/fences/{fa}").json() == definition_before
+    # 全部围栏的事件/穿越（内容及 id）均保持调整前
+    assert event_rows(client) == events_all_before
+    assert crossing_rows(client) == crossings_all_before
+
+    # 回滚后服务仍可正常重算（后续摄入读到与调整前一致的 A 定义）
+    submit(client, [pt("dev3", 0, 0.005, 0.005)])
+    assert [e[3] for e in event_rows(client, fence_id=fa, device_id="dev3")] == ["enter"]
+
 
 
 def test_adjust_refreshes_capacity_clearance_rendezvous_handover_isolation(client):

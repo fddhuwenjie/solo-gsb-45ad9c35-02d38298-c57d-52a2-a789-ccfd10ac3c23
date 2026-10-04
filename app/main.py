@@ -153,6 +153,80 @@ def _sanitize_json(value):
 
 # ---------- 内部逻辑 ----------
 
+def _device_points(db: Session, device_id: str) -> list[TrackPoint]:
+    """取设备全量轨迹（按时间升序），用于全量重放。"""
+    rows = (
+        db.query(TrackPointRow)
+        .filter_by(device_id=device_id)
+        .order_by(TrackPointRow.ts)
+        .all()
+    )
+    return [TrackPoint(ts=r.ts, lat=r.lat, lon=r.lon) for r in rows]
+
+
+def _replace_fence_results(
+    db: Session, device_id: str, fence: Fence, gates: list[GateLineRow],
+    points: list[TrackPoint],
+) -> None:
+    """只替换该 (设备, 围栏) 维度下的事件、当前状态与门线穿越。
+
+    删除条件同时带 device_id 与 fence_id：其他围栏在该设备下的记录及其
+    自增 ID 完全不被触碰。围栏调整时按设备逐一调用本函数，即可只刷新
+    目标围栏的衍生记录而不动其他围栏。
+    """
+    polygon = shape(json.loads(fence.geometry))
+    cfg = FenceConfig(
+        enter_buffer_m=fence.enter_buffer_m,
+        exit_buffer_m=fence.exit_buffer_m,
+        enter_dwell_s=fence.enter_dwell_s,
+        exit_dwell_s=fence.exit_dwell_s,
+        stay_min_s=fence.stay_min_s,
+    )
+    pf = ProjectedFence(fence.id, polygon, cfg)
+    events, inside, since = compute_events(pf, points)
+
+    db.query(Event).filter(
+        Event.device_id == device_id, Event.fence_id == fence.id
+    ).delete()
+    db.query(DeviceState).filter(
+        DeviceState.device_id == device_id, DeviceState.fence_id == fence.id
+    ).delete()
+    db.query(Crossing).filter(
+        Crossing.device_id == device_id, Crossing.fence_id == fence.id
+    ).delete()
+
+    for e in events:
+        db.add(Event(device_id=device_id, fence_id=e.fence_id, type=e.type, ts=e.ts))
+    db.add(DeviceState(
+        device_id=device_id,
+        fence_id=fence.id,
+        state="inside" if inside else "outside",
+        since=since,
+    ))
+
+    lat0, lon0 = pf.origin
+    gate_lines = []
+    for g in gates:
+        coords_ll = [tuple(c[:2]) for c in json.loads(g.geometry)["coordinates"]]
+        gate_lines.append(GateLine(
+            gate_id=g.id,
+            coords=project_points(coords_ll, lat0, lon0),
+            forward_name=g.forward_name,
+            reverse_name=g.reverse_name,
+            min_displacement_m=g.min_displacement_m,
+        ))
+    for c in compute_crossings(gate_lines, points, lat0, lon0):
+        db.add(Crossing(
+            device_id=device_id,
+            fence_id=fence.id,
+            gate_id=c.gate_id,
+            direction=c.direction,
+            ts=c.ts,
+            lat=c.lat,
+            lon=c.lon,
+        ))
+
+
 def recompute_device(db: Session, device_id: str, commit: bool = True) -> None:
     """按设备全量轨迹（按时间升序）重算该设备在所有围栏下的事件与当前状态。
 
@@ -162,64 +236,33 @@ def recompute_device(db: Session, device_id: str, commit: bool = True) -> None:
     commit=False 时只在当前事务内完成删除/写入而不提交，供坐标更正等需要
     与坐标更新原子提交的调用方使用；调用方负责最终 commit 或 rollback。
     """
-    rows = (
-        db.query(TrackPointRow)
-        .filter_by(device_id=device_id)
-        .order_by(TrackPointRow.ts)
-        .all()
-    )
-    points = [TrackPoint(ts=r.ts, lat=r.lat, lon=r.lon) for r in rows]
+    points = _device_points(db, device_id)
     fences = db.query(Fence).all()
     gates = db.query(GateLineRow).all()
     gates_by_fence: dict[int, list[GateLineRow]] = {}
     for g in gates:
         gates_by_fence.setdefault(g.fence_id, []).append(g)
 
-    db.query(Event).filter_by(device_id=device_id).delete()
-    db.query(DeviceState).filter_by(device_id=device_id).delete()
-    db.query(Crossing).filter_by(device_id=device_id).delete()
-
+    # 逐围栏整体替换该设备的衍生记录（先删后写、按 fence_id 限定）；
+    # 全部围栏合起来即覆盖该设备在所有围栏下的记录。
     for f in fences:
-        polygon = shape(json.loads(f.geometry))
-        cfg = FenceConfig(
-            enter_buffer_m=f.enter_buffer_m,
-            exit_buffer_m=f.exit_buffer_m,
-            enter_dwell_s=f.enter_dwell_s,
-            exit_dwell_s=f.exit_dwell_s,
-            stay_min_s=f.stay_min_s,
-        )
-        pf = ProjectedFence(f.id, polygon, cfg)
-        events, inside, since = compute_events(pf, points)
-        for e in events:
-            db.add(Event(device_id=device_id, fence_id=e.fence_id, type=e.type, ts=e.ts))
-        db.add(DeviceState(
-            device_id=device_id,
-            fence_id=f.id,
-            state="inside" if inside else "outside",
-            since=since,
-        ))
+        _replace_fence_results(db, device_id, f, gates_by_fence.get(f.id, []), points)
 
-        lat0, lon0 = pf.origin
-        gate_lines = []
-        for g in gates_by_fence.get(f.id, []):
-            coords_ll = [tuple(c[:2]) for c in json.loads(g.geometry)["coordinates"]]
-            gate_lines.append(GateLine(
-                gate_id=g.id,
-                coords=project_points(coords_ll, lat0, lon0),
-                forward_name=g.forward_name,
-                reverse_name=g.reverse_name,
-                min_displacement_m=g.min_displacement_m,
-            ))
-        for c in compute_crossings(gate_lines, points, lat0, lon0):
-            db.add(Crossing(
-                device_id=device_id,
-                fence_id=f.id,
-                gate_id=c.gate_id,
-                direction=c.direction,
-                ts=c.ts,
-                lat=c.lat,
-                lon=c.lon,
-            ))
+    if commit:
+        db.commit()
+
+
+def recompute_fence(db: Session, fence: Fence, device_ids: list[str], commit: bool = True) -> None:
+    """按各设备全量轨迹，只重算它们在单个围栏下的事件、当前状态与门线穿越。
+
+    供围栏调整使用：目标围栏定义已在当前事务内更新后，逐设备仅替换该
+    (设备, 目标围栏) 的衍生记录，其他围栏的记录与自增 ID 保持原样。
+    调用方负责最终 commit 或 rollback（重算失败应整体回滚围栏定义更新）。
+    """
+    gates = db.query(GateLineRow).filter_by(fence_id=fence.id).all()
+    for device_id in device_ids:
+        points = _device_points(db, device_id)
+        _replace_fence_results(db, device_id, fence, gates, points)
     if commit:
         db.commit()
 
@@ -328,11 +371,12 @@ def update_fence(fence_id: int, body: FenceUpdate, db: Session = Depends(get_db)
     404。现有门线若越出新有效区域或穿过新孔洞，返回 422 并在 detail 中列出
     冲突门线 ID，围栏定义与一切衍生记录保持原样。
 
-    调整与轨迹摄入、坐标更正共用同一把串行锁；围栏定义、该围栏所有设备的
-    enter/leave/stay 事件、当前状态与门线穿越在同一事务内一次提交，任一步
-    重算失败整体回滚，其他围栏的结果不变。容量、清场、协同、交班与隔离报告
-    均由事件实时重建，调整后再次查询即反映新事件；门线与巡检路线原样保留、
-    继续可用。
+    调整与轨迹摄入、坐标更正共用同一把串行锁；围栏定义与该围栏在各存量
+    设备下的 enter/leave/stay 事件、当前状态与门线穿越在同一事务内一次
+    提交，任一步重算失败整体回滚。只替换目标围栏的衍生记录，其他围栏的
+    记录及公开 ID（事件/穿越主键）保持原样。容量、清场、协同、交班与隔离
+    报告均由事件实时重建，调整后再次查询即反映新事件；门线与巡检路线原样
+    保留、继续可用。
     """
     fence = db.get(Fence, fence_id)
     if fence is None:
@@ -365,11 +409,10 @@ def update_fence(fence_id: int, body: FenceUpdate, db: Session = Depends(get_db)
             fence.stay_min_s = body.config.stay_min_s
             db.flush()  # 让后续重算读到新定义
 
-            # 新边界与去抖规则对所有存量设备轨迹生效；事件/状态/穿越整体替换，
-            # 其他围栏的结果在同一设备重算中一并现算，结果不受影响。
+            # 新边界与去抖规则对所有存量设备轨迹生效；只整体替换目标围栏在
+            # 各设备下的事件/状态/穿越，其他围栏的记录与 ID 原样保留。
             device_ids = [r[0] for r in db.query(TrackPointRow.device_id).distinct()]
-            for device_id in device_ids:
-                recompute_device(db, device_id, commit=False)
+            recompute_fence(db, fence, device_ids, commit=False)
             db.commit()
         except Exception:
             # 重算失败不能留下新围栏配旧事件：定义更新与衍生结果整体回滚
