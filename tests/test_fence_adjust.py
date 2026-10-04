@@ -248,6 +248,57 @@ def test_adjust_one_fence_leaves_other_fence_results_unchanged(client):
     assert event_keys(client, fence_id=f2) == before_b
 
 
+def test_adjust_preserves_other_fences_record_ids(client):
+    # 两个围栏，B 带门线；dev1 先进入 A，再进入 B 并穿过 B 的门线
+    f1 = create_fence(client, square(0, 0, 0.02, 0.02), name="A")
+    f2 = create_fence(client, square(0.04, 0.04, 0.06, 0.06), name="B")
+    g2 = client.post(f"/fences/{f2}/gates", json={
+        "geometry": {"type": "LineString",
+                     "coordinates": [[0.045, 0.05], [0.055, 0.05]]},
+        "forward_name": "南向北",
+        "reverse_name": "北向南",
+    }).json()["id"]
+
+    submit(client, [
+        pt("dev1", 0, 0.01, 0.01),        # A 内
+        pt("dev1", 50, 0.049, 0.05),      # 离开 A、进入 B（门线南侧）
+        pt("dev1", 60, 0.051, 0.05),      # 穿过 B 的门线（forward）
+    ])
+
+    r = client.get("/events", params={"fence_id": f2})
+    events_b_before = r.json()
+    assert [e["type"] for e in events_b_before] == ["enter"]
+    r = client.get("/crossings", params={"fence_id": f2})
+    crossings_b_before = r.json()
+    assert [(c["gate_id"], c["direction"]) for c in crossings_b_before] == [
+        (g2, "forward")
+    ]
+    status_b_before = {
+        f["fence_id"]: f
+        for f in client.get("/devices/dev1/status").json()["fences"]
+    }[f2]
+
+    # 收紧 A：dev1 的第一个点落到界外，A 的事件被重算清除
+    r = adjust(client, f1, geometry=square(0, 0, 0.005, 0.005))
+    assert r.status_code == 200, r.text
+    assert client.get("/events", params={"fence_id": f1}).json() == []
+
+    # B 的事件与穿越原样保留：内容与公开 ID 完全一致
+    events_b_after = client.get("/events", params={"fence_id": f2}).json()
+    assert events_b_after == events_b_before
+    assert [e["id"] for e in events_b_after] == [e["id"] for e in events_b_before]
+    crossings_b_after = client.get("/crossings", params={"fence_id": f2}).json()
+    assert crossings_b_after == crossings_b_before
+    assert [c["id"] for c in crossings_b_after] == [c["id"] for c in crossings_b_before]
+
+    # dev1 在 B 下的当前状态不变
+    status_b_after = {
+        f["fence_id"]: f
+        for f in client.get("/devices/dev1/status").json()["fences"]
+    }[f2]
+    assert status_b_after == status_b_before
+
+
 def test_adjust_refreshes_capacity_clearance_rendezvous_handover_isolation(client):
     # 围栏 1：[0,0]-[0.01,0.01]；dev1 t0 在内、t100 走到 (0.02,0.02) 出界
     f1 = create_fence(client, square(0, 0, 0.01, 0.01), name="主围栏")
